@@ -45,6 +45,48 @@ pip install -r requirements.txt
 
 ---
 
+## Step 0 — Download the Dataset from Google Drive
+
+The dataset lives in a shared Google Drive folder. Run the download script once and it will mirror all 35 location folders into `data/raw/` automatically.
+
+### One-time credentials setup (each teammate does this once)
+
+You need a `credentials.json` file from Google Cloud Console. This is a free, standard OAuth2 step:
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (or use an existing one)
+2. Navigate to **APIs & Services → Library** and enable the **Google Drive API**
+3. Go to **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
+4. Choose **Desktop app** as the application type, give it any name
+5. Click **Download JSON** and rename the file to `credentials.json`
+6. Place `credentials.json` in the **project root** (same level as README.md)
+
+> `credentials.json` and `token.json` are in `.gitignore` — they will never be accidentally committed.
+
+### Download
+
+```bash
+# First run: opens a browser window for Google sign-in consent (takes ~10 seconds)
+python src/download_dataset.py
+
+# Subsequent runs: fully automatic (token is cached in token.json)
+python src/download_dataset.py
+
+# Preview what would be downloaded without writing files
+python src/download_dataset.py --dry-run
+
+# Force re-download everything (ignore already-existing files)
+python src/download_dataset.py --no-resume
+```
+
+The script will:
+- Authenticate via OAuth2 (browser popup on first run only)
+- Walk all 35 location sub-folders recursively
+- Download only image files (jpg, png, heic, etc.), skip anything else
+- Skip files already present locally (`--resume` is on by default)
+- Print a summary of downloaded / skipped / failed counts
+
+---
+
 ## Data Organisation
 
 Place your raw images under `data/raw/` with one sub-folder per location:

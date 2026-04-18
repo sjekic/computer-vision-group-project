@@ -27,6 +27,10 @@ results/*.jpg
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# Google OAuth secrets — NEVER commit these
+credentials.json
+token.json
+
 # OS
 .DS_Store
 Thumbs.db
