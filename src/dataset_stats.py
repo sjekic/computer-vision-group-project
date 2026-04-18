@@ -104,7 +104,7 @@ def compute_stats(data_dir: Path, find_duplicates: bool) -> str:
 
         if heights:
             lines.append(f"\nLocation: {location}  ({len(images)} images)")
-            lines.append(f"  Resolutions  : {min(widths)}x{min(heights)} → {max(widths)}x{max(heights)}")
+            lines.append(f"  Resolutions  : {min(widths)}x{min(heights)} to {max(widths)}x{max(heights)}")
             lines.append(f"  Avg size     : {np.mean(widths):.0f} x {np.mean(heights):.0f}")
             lines.append(f"  Brightness   : mean={np.mean(means_r + means_g + means_b):.1f}  "
                          f"std={np.std(means_r + means_g + means_b):.1f}")
@@ -143,7 +143,7 @@ def compute_stats(data_dir: Path, find_duplicates: bool) -> str:
         if dup_pairs:
             lines.append(f"  Found {len(dup_pairs)} near-duplicate pair(s):")
             for p1, p2, d in dup_pairs[:20]:    # cap display at 20
-                lines.append(f"    dist={d:2d}  {p1.name}  ↔  {p2.name}")
+                lines.append(f"    dist={d:2d}  {p1.name}  <->  {p2.name}")
             if len(dup_pairs) > 20:
                 lines.append(f"    ... and {len(dup_pairs) - 20} more")
         else:
@@ -154,7 +154,7 @@ def compute_stats(data_dir: Path, find_duplicates: bool) -> str:
     # Save CSV and report
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(RESULTS_DIR / "dataset_stats.csv", index=False)
-    with open(RESULTS_DIR / "dataset_report.txt", "w") as f:
+    with open(RESULTS_DIR / "dataset_report.txt", "w", encoding="utf-8") as f:
         f.write(report)
 
     logger.info(f"Report saved to results/dataset_report.txt")
