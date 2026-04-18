@@ -1,3 +1,6 @@
+# HEIC/HEIF support (iPhone photos)
+pillow-heif>=0.16.0
+
 # Google Drive API
 google-api-python-client>=2.120.0
 google-auth-httplib2>=0.2.0

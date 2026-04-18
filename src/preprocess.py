@@ -34,6 +34,14 @@ import pandas as pd
 from PIL import Image, ImageEnhance, ImageFilter
 from tqdm import tqdm
 
+# Register HEIC/HEIF support via pillow-heif (iPhone photos)
+# Falls back gracefully if not installed
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass  # pillow-heif not installed; HEIC files will be skipped
+
 # ─── Configuration ────────────────────────────────────────────────────────────
 
 RAW_DIR = Path("data/raw")
@@ -47,8 +55,8 @@ TARGET_SIZE = (640, 480)          # (width, height)  — good for both SIFT & Vi
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-# Supported image extensions
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+# Supported image extensions (HEIC/HEIF added for iPhone photos)
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".heic", ".heif"}
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -74,12 +82,18 @@ def is_valid_image(path: Path) -> bool:
 
 
 def load_image(path: Path) -> np.ndarray:
-    """Load an image as RGB numpy array using OpenCV (handles EXIF rotation)."""
-    img = cv2.imread(str(path))
-    if img is None:
-        raise ValueError(f"cv2 could not read {path}")
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    return img
+    """Load an image as RGB numpy array. Uses Pillow for HEIC, OpenCV for everything else."""
+    suffix = path.suffix.lower()
+    if suffix in {".heic", ".heif"}:
+        # pillow-heif registered as a Pillow plugin, so Image.open works directly
+        pil_img = Image.open(path).convert("RGB")
+        return np.array(pil_img)
+    else:
+        img = cv2.imread(str(path))
+        if img is None:
+            raise ValueError(f"cv2 could not read {path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return img
 
 
 def resize_and_pad(img: np.ndarray, target: tuple[int, int]) -> np.ndarray:

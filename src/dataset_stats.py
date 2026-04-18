@@ -24,10 +24,18 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+try:
+    from pillow_heif import register_heif_opener
+    from PIL import Image as _PIL_Image
+    register_heif_opener()
+    _HEIC_SUPPORT = True
+except ImportError:
+    _HEIC_SUPPORT = False
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".heic", ".heif"}
 RESULTS_DIR = Path("results")
 
 
@@ -75,13 +83,21 @@ def compute_stats(data_dir: Path, find_duplicates: bool) -> str:
         heights, widths, means_r, means_g, means_b = [], [], [], [], []
 
         for img_path in tqdm(images, desc=f"Analysing {location}", leave=False):
-            img = cv2.imread(str(img_path))
-            if img is None:
-                continue
-            h, w = img.shape[:2]
+            if img_path.suffix.lower() in {".heic", ".heif"} and _HEIC_SUPPORT:
+                try:
+                    pil_img = _PIL_Image.open(img_path).convert("RGB")
+                    img_rgb = np.array(pil_img)
+                    h, w = img_rgb.shape[:2]
+                except Exception:
+                    continue
+            else:
+                img = cv2.imread(str(img_path))
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             heights.append(h)
             widths.append(w)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             means_r.append(img_rgb[:, :, 0].mean())
             means_g.append(img_rgb[:, :, 1].mean())
             means_b.append(img_rgb[:, :, 2].mean())
