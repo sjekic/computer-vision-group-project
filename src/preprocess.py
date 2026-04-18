@@ -147,41 +147,112 @@ def save_image(img: np.ndarray, path: Path):
 def augment(img: np.ndarray) -> list[tuple[str, np.ndarray]]:
     """
     Returns a list of (suffix, augmented_image) tuples.
-    Augmentations simulate real-world query variability:
-      - Brightness shifts   (morning vs evening light)
-      - Horizontal flip     (mirrored viewpoint)
-      - Slight rotation     (handheld camera tilt)
-      - Gaussian blur       (motion / focus blur)
-      - Saturation shift    (different phone camera profiles)
+    Covers photometric and geometric distortions to simulate real query conditions:
+
+    Photometric:
+      aug_bright    brightness +35%
+      aug_dark      brightness -35%
+      aug_overexp   brightness +70% (harsh sunlight / window glare)
+      aug_contrast  contrast +40%
+      aug_lowcontrast contrast -30% (flat lighting / overcast)
+      aug_desat     saturation -60% (cloudy day / greyscale-ish)
+      aug_vivid     saturation +50% (phone auto-enhance)
+      aug_warm      warm colour shift (yellow tint)
+      aug_cool      cool colour shift (blue tint)
+      aug_blur      Gaussian blur r=2 (motion / focus blur)
+      aug_blur_hard Gaussian blur r=4 (heavy motion)
+      aug_noise     Gaussian noise (low-light grain)
+      aug_jpeg      JPEG compression artefacts (low-quality screenshot)
+
+    Geometric:
+      aug_flip      horizontal mirror
+      aug_rot5      clockwise 5 degree tilt
+      aug_rot355    counter-clockwise 5 degree tilt
+      aug_crop_tl   10% crop from top-left (zoomed-in viewpoint)
+      aug_crop_br   10% crop from bottom-right
+      aug_zoom      15% zoom in (centre crop)
+      aug_skew_h    horizontal perspective skew (camera angled left)
+      aug_skew_v    vertical perspective skew (camera tilted up)
     """
     pil = Image.fromarray(img)
+    h, w = img.shape[:2]
     results = []
 
-    # 1. Brightness +30%
-    bright = ImageEnhance.Brightness(pil).enhance(1.3)
-    results.append(("aug_bright", np.array(bright)))
+    # ── Photometric ──────────────────────────────────────────────────────────
 
-    # 2. Brightness -30%
-    dark = ImageEnhance.Brightness(pil).enhance(0.7)
-    results.append(("aug_dark", np.array(dark)))
+    # Brightness
+    results.append(("aug_bright",    np.array(ImageEnhance.Brightness(pil).enhance(1.35))))
+    results.append(("aug_dark",      np.array(ImageEnhance.Brightness(pil).enhance(0.65))))
+    results.append(("aug_overexp",   np.array(ImageEnhance.Brightness(pil).enhance(1.70))))
 
-    # 3. Horizontal flip
-    flipped = np.fliplr(img)
-    results.append(("aug_flip", flipped))
+    # Contrast
+    results.append(("aug_contrast",     np.array(ImageEnhance.Contrast(pil).enhance(1.40))))
+    results.append(("aug_lowcontrast",  np.array(ImageEnhance.Contrast(pil).enhance(0.70))))
 
-    # 4. Slight CW rotation (5°)
-    h, w = img.shape[:2]
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), 5, 1.0)
-    rotated = cv2.warpAffine(img, M, (w, h), borderMode=cv2.BORDER_REFLECT)
-    results.append(("aug_rot5", rotated))
+    # Colour / saturation
+    results.append(("aug_desat",  np.array(ImageEnhance.Color(pil).enhance(0.40))))
+    results.append(("aug_vivid",  np.array(ImageEnhance.Color(pil).enhance(1.50))))
 
-    # 5. Gaussian blur (simulates motion)
-    blurred = np.array(pil.filter(ImageFilter.GaussianBlur(radius=2)))
-    results.append(("aug_blur", blurred))
+    # Warm tint (boost R, reduce B)
+    warm = img.copy().astype(np.int16)
+    warm[:, :, 0] = np.clip(warm[:, :, 0] + 20, 0, 255)   # R up
+    warm[:, :, 2] = np.clip(warm[:, :, 2] - 20, 0, 255)   # B down
+    results.append(("aug_warm", warm.astype(np.uint8)))
 
-    # 6. Low saturation (greyscale-ish — cloudy day)
-    desat = ImageEnhance.Color(pil).enhance(0.4)
-    results.append(("aug_desat", np.array(desat)))
+    # Cool tint (boost B, reduce R)
+    cool = img.copy().astype(np.int16)
+    cool[:, :, 0] = np.clip(cool[:, :, 0] - 20, 0, 255)
+    cool[:, :, 2] = np.clip(cool[:, :, 2] + 20, 0, 255)
+    results.append(("aug_cool", cool.astype(np.uint8)))
+
+    # Blur
+    results.append(("aug_blur",      np.array(pil.filter(ImageFilter.GaussianBlur(radius=2)))))
+    results.append(("aug_blur_hard", np.array(pil.filter(ImageFilter.GaussianBlur(radius=4)))))
+
+    # Gaussian noise
+    noise = np.random.normal(0, 18, img.shape).astype(np.int16)
+    noisy = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    results.append(("aug_noise", noisy))
+
+    # JPEG compression artefacts
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 20]
+    _, enc = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR), encode_param)
+    jpeg_img = cv2.cvtColor(cv2.imdecode(enc, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+    results.append(("aug_jpeg", jpeg_img))
+
+    # ── Geometric ────────────────────────────────────────────────────────────
+
+    # Horizontal flip
+    results.append(("aug_flip", np.fliplr(img)))
+
+    # Rotations
+    M_cw  = cv2.getRotationMatrix2D((w / 2, h / 2),  5, 1.0)
+    M_ccw = cv2.getRotationMatrix2D((w / 2, h / 2), -5, 1.0)
+    results.append(("aug_rot5",   cv2.warpAffine(img, M_cw,  (w, h), borderMode=cv2.BORDER_REFLECT)))
+    results.append(("aug_rot355", cv2.warpAffine(img, M_ccw, (w, h), borderMode=cv2.BORDER_REFLECT)))
+
+    # Corner crops (simulate partial viewpoint)
+    crop = int(min(w, h) * 0.10)
+    tl = img[0:h - crop, 0:w - crop]          # top-left crop
+    br = img[crop:h,     crop:w]              # bottom-right crop
+    results.append(("aug_crop_tl", cv2.resize(tl, (w, h), interpolation=cv2.INTER_LANCZOS4)))
+    results.append(("aug_crop_br", cv2.resize(br, (w, h), interpolation=cv2.INTER_LANCZOS4)))
+
+    # Centre zoom (15%)
+    zx, zy = int(w * 0.075), int(h * 0.075)
+    zoomed = img[zy:h - zy, zx:w - zx]
+    results.append(("aug_zoom", cv2.resize(zoomed, (w, h), interpolation=cv2.INTER_LANCZOS4)))
+
+    # Horizontal perspective skew (camera angled left — right side compressed)
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    skew_h = np.float32([[0, int(h * 0.08)], [w, 0], [w, h], [0, int(h * 0.92)]])
+    M_sh = cv2.getPerspectiveTransform(src, skew_h)
+    results.append(("aug_skew_h", cv2.warpPerspective(img, M_sh, (w, h), borderMode=cv2.BORDER_REFLECT)))
+
+    # Vertical perspective skew (camera tilted upward — bottom wider)
+    skew_v = np.float32([[int(w * 0.08), 0], [int(w * 0.92), 0], [w, h], [0, h]])
+    M_sv = cv2.getPerspectiveTransform(src, skew_v)
+    results.append(("aug_skew_v", cv2.warpPerspective(img, M_sv, (w, h), borderMode=cv2.BORDER_REFLECT)))
 
     return results
 
