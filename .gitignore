@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.env
+dist/
+build/
+
+# Data (keep gitkeeps, ignore actual images & large files)
+data/raw/*
+data/processed/*
+data/query/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/query/.gitkeep
+
+# Models & results
+models/*.pt
+models/*.pth
+models/*.bin
+models/*.onnx
+results/*.png
+results/*.jpg
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
