@@ -21,6 +21,9 @@ import cv2
 import numpy as np
 import faiss
 
+from anyloc_features import encode_anyloc_image
+from retrieval_config import index_filename, resolve_methods
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s",
                     level=logging.INFO, datefmt="%H:%M:%S")
 logger = logging.getLogger(__name__)
@@ -112,6 +115,20 @@ def encode_sift_vlad(img_rgb: np.ndarray, sift, codebook: np.ndarray) -> np.ndar
     return vec / n if n > 0 else vec
 
 
+def encode_orb_bow(img_rgb: np.ndarray, orb, codebook: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    _, raw = orb.detectAndCompute(gray, None)
+    bow = np.zeros(codebook.shape[0], dtype=np.float32)
+    if raw is not None and len(raw) > 0:
+        flann = cv2.FlannBasedMatcher({"algorithm": 1, "trees": 4}, {"checks": 32})
+        matches = flann.knnMatch(raw.astype(np.float32), codebook.astype(np.float32), k=1)
+        for m in matches:
+            if m:
+                bow[m[0].trainIdx] += 1
+    n = np.linalg.norm(bow)
+    return bow / n if n > 0 else bow
+
+
 def encode_dinov2(img_rgb: np.ndarray, model, device, transform) -> np.ndarray:
     import torch
     from PIL import Image
@@ -121,6 +138,10 @@ def encode_dinov2(img_rgb: np.ndarray, model, device, transform) -> np.ndarray:
         feat = model(tensor).cpu().numpy().astype(np.float32)
     norm = np.linalg.norm(feat, axis=1, keepdims=True)
     return feat / np.maximum(norm, 1e-8)
+
+
+def encode_anyloc(img_rgb: np.ndarray, model, device, transform, codebook: np.ndarray) -> np.ndarray:
+    return encode_anyloc_image(img_rgb, model, device, transform, codebook)
 
 
 # ─── Grid builder ─────────────────────────────────────────────────────────────
@@ -243,11 +264,13 @@ def build_result_grid(
 def main():
     parser = argparse.ArgumentParser(description="Visual demo of image retrieval system")
     parser.add_argument("--query",      type=Path, required=True, help="Query image path")
-    parser.add_argument("--method",     choices=["sift", "dinov2", "both"], default="both")
+    parser.add_argument("--method",     choices=["sift", "orb", "dinov2", "anyloc", "both", "all"], default="both")
     parser.add_argument("--k",          type=int,  default=5)
     parser.add_argument("--save",       action="store_true", help="Save grid to results/")
     parser.add_argument("--no-show",    action="store_true", help="Don't display window")
     parser.add_argument("--models-dir", type=Path, default=MODELS_DIR)
+    parser.add_argument("--index-type", choices=["flat", "ivf", "hnsw"], default="flat")
+    parser.add_argument("--nprobe",     type=int, default=10, help="Number of IVF lists to probe")
     args = parser.parse_args()
 
     if not args.query.exists():
@@ -256,9 +279,10 @@ def main():
 
     # Load resources
     resources = {}
+    methods = resolve_methods(args.method)
 
-    if args.method in ("sift", "both"):
-        idx_p = args.models_dir / "sift_vlad.index"
+    if "sift" in methods:
+        idx_p = args.models_dir / index_filename("sift", args.index_type)
         cb_p  = args.models_dir / "sift_codebook.npy"
         lb_p  = args.models_dir / "sift_vlad_labels.npy"
         if all(p.exists() for p in [idx_p, cb_p, lb_p]):
@@ -268,9 +292,25 @@ def main():
                 "labels":   list(np.load(lb_p)),
                 "sift":     cv2.SIFT_create(nfeatures=500),
             }
+            if hasattr(resources["sift"]["index"], "nprobe"):
+                resources["sift"]["index"].nprobe = args.nprobe
 
-    if args.method in ("dinov2", "both"):
-        idx_p = args.models_dir / "dinov2.index"
+    if "orb" in methods:
+        idx_p = args.models_dir / index_filename("orb", args.index_type)
+        cb_p  = args.models_dir / "orb_codebook.npy"
+        lb_p  = args.models_dir / "orb_labels.npy"
+        if all(p.exists() for p in [idx_p, cb_p, lb_p]):
+            resources["orb"] = {
+                "index":    faiss.read_index(str(idx_p)),
+                "codebook": np.load(cb_p),
+                "labels":   list(np.load(lb_p)),
+                "orb":      cv2.ORB_create(nfeatures=500),
+            }
+            if hasattr(resources["orb"]["index"], "nprobe"):
+                resources["orb"]["index"].nprobe = args.nprobe
+
+    if "dinov2" in methods:
+        idx_p = args.models_dir / index_filename("dinov2", args.index_type)
         lb_p  = args.models_dir / "dinov2_labels.npy"
         if all(p.exists() for p in [idx_p, lb_p]):
             import torch
@@ -288,6 +328,32 @@ def main():
                 "labels": list(np.load(lb_p)),
                 "model": model, "device": device, "transform": transform,
             }
+            if hasattr(resources["dinov2"]["index"], "nprobe"):
+                resources["dinov2"]["index"].nprobe = args.nprobe
+
+    if "anyloc" in methods:
+        idx_p = args.models_dir / index_filename("anyloc", args.index_type)
+        cb_p  = args.models_dir / "anyloc_dinov2_codebook.npy"
+        lb_p  = args.models_dir / "anyloc_dinov2_vlad_labels.npy"
+        if all(p.exists() for p in [idx_p, cb_p, lb_p]):
+            import torch
+            from torchvision import transforms
+            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device).eval()
+            transform = transforms.Compose([
+                transforms.Resize(256), transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+            ])
+            resources["anyloc"] = {
+                "index": faiss.read_index(str(idx_p)),
+                "codebook": np.load(cb_p),
+                "labels": list(np.load(lb_p)),
+                "model": model, "device": device, "transform": transform,
+            }
+            if hasattr(resources["anyloc"]["index"], "nprobe"):
+                resources["anyloc"]["index"].nprobe = args.nprobe
 
     if not resources:
         logger.error("No indexes found. Run extract.py and index.py first.")
@@ -320,6 +386,22 @@ def main():
             tick = " ✓" if gt_location and loc == gt_location else ""
             print(f"  #{rank}  {loc:<30}  dist={sc:.4f}{tick}")
 
+    if "orb" in resources:
+        r = resources["orb"]
+        vec = encode_orb_bow(img_rgb, r["orb"], r["codebook"])
+        vec2d = vec.reshape(1, -1).astype(np.float32)
+        t0 = time.perf_counter()
+        dists, idxs = r["index"].search(vec2d, args.k)
+        lat = (time.perf_counter() - t0) * 1000
+        results = [(r["labels"][i], float(dists[0][j])) for j, i in enumerate(idxs[0]) if i >= 0]
+        method_results.append(("ORB + BoW", results, lat))
+
+        print(f"\nORB+BoW ({lat:.1f} ms)")
+        for rank, (iid, sc) in enumerate(results, 1):
+            loc = iid.split("/")[0]
+            tick = " ✓" if gt_location and loc == gt_location else ""
+            print(f"  #{rank}  {loc:<30}  dist={sc:.4f}{tick}")
+
     if "dinov2" in resources:
         r = resources["dinov2"]
         vec = encode_dinov2(img_rgb, r["model"], r["device"], r["transform"])
@@ -330,6 +412,22 @@ def main():
         method_results.append(("DINOv2 ViT-S/14", results, lat))
 
         print(f"\nDINOv2 ({lat:.1f} ms)")
+        for rank, (iid, sc) in enumerate(results, 1):
+            loc = iid.split("/")[0]
+            tick = " ✓" if gt_location and loc == gt_location else ""
+            print(f"  #{rank}  {loc:<30}  score={sc:.4f}{tick}")
+
+    if "anyloc" in resources:
+        r = resources["anyloc"]
+        vec = encode_anyloc(img_rgb, r["model"], r["device"], r["transform"], r["codebook"])
+        vec2d = vec.reshape(1, -1).astype(np.float32)
+        t0 = time.perf_counter()
+        scores, idxs = r["index"].search(vec2d, args.k)
+        lat = (time.perf_counter() - t0) * 1000
+        results = [(r["labels"][i], float(scores[0][j])) for j, i in enumerate(idxs[0]) if i >= 0]
+        method_results.append(("AnyLoc-DINOv2-VLAD", results, lat))
+
+        print(f"\nAnyLoc-DINOv2-VLAD ({lat:.1f} ms)")
         for rank, (iid, sc) in enumerate(results, 1):
             loc = iid.split("/")[0]
             tick = " ✓" if gt_location and loc == gt_location else ""

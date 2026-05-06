@@ -22,10 +22,14 @@ import argparse
 import logging
 import time
 from pathlib import Path
+from collections import Counter
 
 import cv2
 import numpy as np
 import faiss
+
+from anyloc_features import encode_anyloc_image
+from retrieval_config import index_filename, resolve_methods
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -108,6 +112,33 @@ def query_sift_vlad(img_rgb: np.ndarray, index: faiss.Index,
 
 # ─── DINOv2 query ─────────────────────────────────────────────────────────────
 
+def query_orb_bow(img_rgb: np.ndarray, index: faiss.Index,
+                  codebook: np.ndarray, labels: list[str], k: int):
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    orb = cv2.ORB_create(nfeatures=500)
+    _, raw = orb.detectAndCompute(gray, None)
+
+    bow = np.zeros(codebook.shape[0], dtype=np.float32)
+    if raw is not None and len(raw) > 0:
+        flann = cv2.FlannBasedMatcher({"algorithm": 1, "trees": 4}, {"checks": 32})
+        matches = flann.knnMatch(raw.astype(np.float32), codebook.astype(np.float32), k=1)
+        for m in matches:
+            if m:
+                bow[m[0].trainIdx] += 1
+
+    norm = np.linalg.norm(bow)
+    if norm > 0:
+        bow /= norm
+
+    vec = bow.reshape(1, -1).astype(np.float32)
+    t0 = time.perf_counter()
+    distances, indices = index.search(vec, k)
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    results = [(labels[i], float(distances[0][j])) for j, i in enumerate(indices[0]) if i >= 0]
+    return results, latency_ms
+
+
 def query_dinov2(img_rgb: np.ndarray, index: faiss.Index,
                  labels: list[str], k: int, model, device, transform):
     from PIL import Image
@@ -127,6 +158,18 @@ def query_dinov2(img_rgb: np.ndarray, index: faiss.Index,
     scores, indices = index.search(feat, k)
     latency_ms = (time.perf_counter() - t0) * 1000
 
+    results = [(labels[i], float(scores[0][j])) for j, i in enumerate(indices[0]) if i >= 0]
+    return results, latency_ms
+
+
+def query_anyloc(img_rgb: np.ndarray, index: faiss.Index,
+                 codebook: np.ndarray, labels: list[str], k: int,
+                 model, device, transform):
+    vec = encode_anyloc_image(img_rgb, model, device, transform, codebook)
+    vec = vec.reshape(1, -1).astype(np.float32)
+    t0 = time.perf_counter()
+    scores, indices = index.search(vec, k)
+    latency_ms = (time.perf_counter() - t0) * 1000
     results = [(labels[i], float(scores[0][j])) for j, i in enumerate(indices[0]) if i >= 0]
     return results, latency_ms
 
@@ -155,6 +198,12 @@ def print_results(method: str, results: list, latency_ms: float, query_location:
         top5_locs = [extract_location(r[0]) for r in results[:5]]
         print(f"  Top-1 correct: {'YES' if top1_loc == query_location else 'NO'}")
         print(f"  Top-5 correct: {'YES' if query_location in top5_locs else 'NO'}")
+
+    if results:
+        votes = Counter(extract_location(image_id) for image_id, _ in results)
+        predicted, count = votes.most_common(1)[0]
+        confidence = count / len(results)
+        print(f"  Predicted location: {predicted}  (top-{len(results)} vote={confidence:.0%})")
 
 
 def show_results_grid(query_path: Path, results: list[tuple[str, float]], method: str):
@@ -192,12 +241,13 @@ def show_results_grid(query_path: Path, results: list[tuple[str, float]], method
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def load_resources(method: str, models_dir: Path):
+def load_resources(method: str, models_dir: Path, index_type: str = "flat", nprobe: int = 10):
     """Load index, labels and (for dinov2) model."""
     resources = {}
+    methods = resolve_methods(method)
 
-    if method in ("sift", "both"):
-        idx_path = models_dir / "sift_vlad.index"
+    if "sift" in methods:
+        idx_path = models_dir / index_filename("sift", index_type)
         cb_path  = models_dir / "sift_codebook.npy"
         lb_path  = models_dir / "sift_vlad_labels.npy"
         if not all(p.exists() for p in [idx_path, cb_path, lb_path]):
@@ -208,9 +258,26 @@ def load_resources(method: str, models_dir: Path):
                 "codebook": np.load(cb_path),
                 "labels":   list(np.load(lb_path)),
             }
+            if hasattr(resources["sift"]["index"], "nprobe"):
+                resources["sift"]["index"].nprobe = nprobe
 
-    if method in ("dinov2", "both"):
-        idx_path = models_dir / "dinov2.index"
+    if "orb" in methods:
+        idx_path = models_dir / index_filename("orb", index_type)
+        cb_path  = models_dir / "orb_codebook.npy"
+        lb_path  = models_dir / "orb_labels.npy"
+        if not all(p.exists() for p in [idx_path, cb_path, lb_path]):
+            logger.error("ORB resources missing. Run extract.py --method orb and index.py --method orb first.")
+        else:
+            resources["orb"] = {
+                "index":    faiss.read_index(str(idx_path)),
+                "codebook": np.load(cb_path),
+                "labels":   list(np.load(lb_path)),
+            }
+            if hasattr(resources["orb"]["index"], "nprobe"):
+                resources["orb"]["index"].nprobe = nprobe
+
+    if "dinov2" in methods:
+        idx_path = models_dir / index_filename("dinov2", index_type)
         lb_path  = models_dir / "dinov2_labels.npy"
         if not all(p.exists() for p in [idx_path, lb_path]):
             logger.error("DINOv2 resources missing. Run extract.py and index.py first.")
@@ -238,6 +305,41 @@ def load_resources(method: str, models_dir: Path):
                 "device":    device,
                 "transform": transform,
             }
+            if hasattr(resources["dinov2"]["index"], "nprobe"):
+                resources["dinov2"]["index"].nprobe = nprobe
+
+    if "anyloc" in methods:
+        idx_path = models_dir / index_filename("anyloc", index_type)
+        cb_path  = models_dir / "anyloc_dinov2_codebook.npy"
+        lb_path  = models_dir / "anyloc_dinov2_vlad_labels.npy"
+        if not all(p.exists() for p in [idx_path, cb_path, lb_path]):
+            logger.error("AnyLoc resources missing. Run extract.py --method anyloc and index.py --method anyloc first.")
+        else:
+            import torch
+            from torchvision import transforms
+
+            logger.info("Loading DINOv2 model for AnyLoc inference...")
+            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            model = model.to(device).eval()
+            transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225]),
+            ])
+
+            resources["anyloc"] = {
+                "index":     faiss.read_index(str(idx_path)),
+                "codebook":  np.load(cb_path),
+                "labels":    list(np.load(lb_path)),
+                "model":     model,
+                "device":    device,
+                "transform": transform,
+            }
+            if hasattr(resources["anyloc"]["index"], "nprobe"):
+                resources["anyloc"]["index"].nprobe = nprobe
 
     return resources
 
@@ -255,6 +357,15 @@ def run_query(query_path: Path, resources: dict, k: int, show: bool,
         if show:
             show_results_grid(query_path, results, "SIFT+VLAD")
 
+    if "orb" in resources:
+        r = resources["orb"]
+        results, latency = query_orb_bow(
+            img, r["index"], r["codebook"], r["labels"], k
+        )
+        print_results("ORB+BoW", results, latency, query_location)
+        if show:
+            show_results_grid(query_path, results, "ORB+BoW")
+
     if "dinov2" in resources:
         r = resources["dinov2"]
         results, latency = query_dinov2(
@@ -265,21 +376,33 @@ def run_query(query_path: Path, resources: dict, k: int, show: bool,
         if show:
             show_results_grid(query_path, results, "DINOv2")
 
+    if "anyloc" in resources:
+        r = resources["anyloc"]
+        results, latency = query_anyloc(
+            img, r["index"], r["codebook"], r["labels"], k,
+            r["model"], r["device"], r["transform"]
+        )
+        print_results("AnyLoc-DINOv2-VLAD", results, latency, query_location)
+        if show:
+            show_results_grid(query_path, results, "AnyLoc-DINOv2-VLAD")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Query the image retrieval system")
     parser.add_argument("--query",        type=Path, default=None, help="Single query image path")
     parser.add_argument("--query-dir",    type=Path, default=None, help="Folder of query images")
-    parser.add_argument("--method",       choices=["sift", "dinov2", "both"], default="both")
+    parser.add_argument("--method",       choices=["sift", "orb", "dinov2", "anyloc", "both", "all"], default="both")
     parser.add_argument("--k",            type=int, default=5,    help="Number of results to return")
     parser.add_argument("--show",         action="store_true",    help="Display results visually")
     parser.add_argument("--models-dir",   type=Path, default=MODELS_DIR)
+    parser.add_argument("--index-type",   choices=["flat", "ivf", "hnsw"], default="flat")
+    parser.add_argument("--nprobe",       type=int, default=10, help="Number of IVF lists to probe")
     args = parser.parse_args()
 
     if args.query is None and args.query_dir is None:
         parser.error("Provide --query <image> or --query-dir <folder>")
 
-    resources = load_resources(args.method, args.models_dir)
+    resources = load_resources(args.method, args.models_dir, args.index_type, args.nprobe)
     if not resources:
         logger.error("No resources loaded. Aborting.")
         return

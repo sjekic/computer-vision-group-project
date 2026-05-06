@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import pickle
 from pathlib import Path
@@ -37,6 +38,8 @@ import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from split_protocol import select_database_records
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -57,6 +60,10 @@ VLAD_K = 64
 DINOV2_MODEL = "facebookresearch/dinov2"
 DINOV2_VARIANT = "dinov2_vits14"
 DINOV2_DIM = 384   # ViT-S embedding dimension
+
+# AnyLoc-style descriptor: DINOv2 patch tokens aggregated with VLAD.
+ANYLOC_K = 32
+ANYLOC_PATCHES_PER_IMAGE = 64
 
 
 # ─── Image loading ────────────────────────────────────────────────────────────
@@ -93,19 +100,23 @@ def load_image_gray(path: Path) -> np.ndarray:
     return img
 
 
-def collect_image_paths(data_dir: Path, skip_aug: bool) -> list[tuple[Path, str]]:
+def collect_image_paths(data_dir: Path, skip_aug: bool = True) -> list[tuple[Path, str]]:
     """
     Walk data_dir/<location>/*.jpg and return (path, image_id) pairs.
-    If skip_aug=True, only include images without 'aug_' in their filename.
+    If skip_aug=True, only include original database images. This is the
+    default to avoid train/query leakage when augmented variants are used as
+    synthetic evaluation queries.
     """
     entries = []
     manifest = data_dir / "manifest.csv"
 
     if manifest.exists():
         df = pd.read_csv(manifest)
-        if skip_aug:
-            df = df[~df["augmented"].astype(bool)]
-        for _, row in df.iterrows():
+        records = select_database_records(
+            df.to_dict("records"),
+            include_augmented=not skip_aug,
+        )
+        for row in records:
             p = Path(row["path"])
             if p.exists() and p.suffix.lower() in IMG_EXTS:
                 entries.append((p, row["image_id"]))
@@ -195,7 +206,11 @@ def compute_vlad(descriptors: np.ndarray, codebook: np.ndarray) -> np.ndarray:
     return vlad
 
 
-def extract_sift_vlad(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[np.ndarray, list[str]]:
+def extract_sift_vlad(
+    entries: list[tuple[Path, str]],
+    save_dir: Path,
+    rebuild_codebook: bool = False,
+) -> tuple[np.ndarray, list[str]]:
     """
     Full SIFT+VLAD pipeline over all images.
     Returns (descriptors array, labels list) and saves to disk.
@@ -203,7 +218,7 @@ def extract_sift_vlad(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[
     codebook_path = save_dir / "sift_codebook.npy"
 
     # Build or load vocabulary
-    if codebook_path.exists():
+    if codebook_path.exists() and not rebuild_codebook:
         logger.info(f"Loading existing VLAD codebook from {codebook_path}")
         codebook = np.load(codebook_path)
     else:
@@ -238,7 +253,7 @@ ORB_K = 64   # BoW vocabulary size (same as VLAD_K for fair comparison)
 
 
 def extract_orb_raw(path: Path, orb) -> np.ndarray | None:
-    """Extract raw ORB binary descriptors (float32 for FLANN). Returns (N, 32) or None."""
+    """Extract raw ORB descriptors as float32 for k-means BoW assignment."""
     img = load_image_gray(path)
     _, desc = orb.detectAndCompute(img, None)
     return desc.astype(np.float32) if desc is not None else None
@@ -272,27 +287,42 @@ def compute_bow(descriptors: np.ndarray | None, codebook: np.ndarray) -> np.ndar
     """Compute normalised Bag-of-Words histogram. Returns (k,) float32 vector."""
     k = codebook.shape[0]
     bow = np.zeros(k, dtype=np.float32)
+
+    # No descriptors for this image -> all zeros
     if descriptors is None or len(descriptors) == 0:
         return bow
 
-    flann = cv2.FlannBasedMatcher(
-        {"algorithm": 6, "table_number": 6, "key_size": 12, "multi_probe_level": 1},
-        {"checks": 32}
-    )
-    matches = flann.knnMatch(descriptors.astype(np.float32), codebook.astype(np.float32), k=1)
-    for m in matches:
-        if m:
-            bow[m[0].trainIdx] += 1
+    # Flatten in case ORB returns (n, 32) uint8 and codebook is (k, 32) float32
+    # Convert both to float32 for distance computation
+    desc_f32 = descriptors.astype(np.float32)
+    code_f32 = codebook.astype(np.float32)
 
+    # Compute squared L2 distance to each codeword and take argmin
+    # desc_f32: (n, d), code_f32: (k, d)
+    # distances: (n, k)
+    diffs = desc_f32[:, None, :] - coe_f32[None, :, :]
+    dists = np.sum(diffs * diffs, axis=2)
+    nearest = np.argmin(dists, axis=1)  # (n,)
+
+    # Build histogram
+    for idx in nearest:
+        bow[idx] += 1
+
+    # L2 normalise
     norm = np.linalg.norm(bow)
     return bow / norm if norm > 0 else bow
 
 
-def extract_orb_bow(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[np.ndarray, list[str]]:
+
+def extract_orb_bow(
+    entries: list[tuple[Path, str]],
+    save_dir: Path,
+    rebuild_codebook: bool = False,
+) -> tuple[np.ndarray, list[str]]:
     """Full ORB+BoW pipeline. Returns (descriptors, labels) and saves to disk."""
     codebook_path = save_dir / "orb_codebook.npy"
 
-    if codebook_path.exists():
+    if codebook_path.exists() and not rebuild_codebook:
         logger.info(f"Loading existing ORB codebook from {codebook_path}")
         codebook = np.load(codebook_path)
     else:
@@ -411,34 +441,174 @@ def extract_dinov2(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[np.
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
+def extract_dinov2_patch_tokens(tensor, model) -> np.ndarray:
+    """Return DINOv2 patch tokens as a (num_patches, dim) float32 array."""
+    import torch
+
+    with torch.no_grad():
+        if hasattr(model, "forward_features"):
+            features = model.forward_features(tensor)
+            if isinstance(features, dict) and "x_norm_patchtokens" in features:
+                tokens = features["x_norm_patchtokens"]
+            elif isinstance(features, dict) and "x_prenorm" in features:
+                tokens = features["x_prenorm"][:, 1:, :]
+            else:
+                raise RuntimeError("DINOv2 forward_features did not expose patch tokens")
+        elif hasattr(model, "get_intermediate_layers"):
+            tokens = model.get_intermediate_layers(
+                tensor,
+                n=1,
+                reshape=False,
+                return_class_token=False,
+            )[0]
+        else:
+            raise RuntimeError("DINOv2 model does not expose patch-token features")
+
+    return tokens.squeeze(0).detach().cpu().numpy().astype(np.float32)
+
+
+def build_anyloc_vocabulary(
+    entries: list[tuple[Path, str]],
+    k: int,
+    model,
+    device: str,
+    transform,
+) -> np.ndarray:
+    """Build a VLAD vocabulary from sampled DINOv2 patch tokens."""
+    from PIL import Image
+
+    logger.info(f"Building AnyLoc DINOv2 patch vocabulary (k={k})...")
+    sampled_tokens = []
+
+    for path, _ in tqdm(entries, desc="Sampling DINOv2 patch tokens"):
+        try:
+            img = Image.open(path).convert("RGB")
+            tensor = transform(img).unsqueeze(0).to(device)
+            tokens = extract_dinov2_patch_tokens(tensor, model)
+        except Exception as e:
+            logger.warning(f"Skipping {path}: {e}")
+            continue
+
+        if len(tokens):
+            n = min(ANYLOC_PATCHES_PER_IMAGE, len(tokens))
+            idx = np.random.choice(len(tokens), n, replace=False)
+            sampled_tokens.append(tokens[idx])
+
+    if not sampled_tokens:
+        raise RuntimeError("No DINOv2 patch tokens were extracted for AnyLoc vocabulary")
+
+    all_tokens = np.vstack(sampled_tokens).astype(np.float32)
+    logger.info(f"Running k-means on {len(all_tokens)} DINOv2 patch tokens...")
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    _, _, codebook = cv2.kmeans(
+        all_tokens, k, None, criteria,
+        attempts=5, flags=cv2.KMEANS_PP_CENTERS
+    )
+    logger.info("AnyLoc vocabulary built.")
+    return codebook
+
+
+def compute_anyloc_vlad(tokens: np.ndarray | None, codebook: np.ndarray) -> np.ndarray:
+    """VLAD-aggregate DINOv2 patch tokens into one normalized vector."""
+    return compute_vlad(tokens, codebook)
+
+
+def extract_anyloc_dinov2_vlad(
+    entries: list[tuple[Path, str]],
+    save_dir: Path,
+    rebuild_codebook: bool = False,
+) -> tuple[np.ndarray, list[str]]:
+    """Extract AnyLoc-style DINOv2 patch VLAD descriptors for all images."""
+    from PIL import Image
+
+    model, device = load_dinov2_model()
+    transform = get_dinov2_transform()
+
+    codebook_path = save_dir / "anyloc_dinov2_codebook.npy"
+    if codebook_path.exists() and not rebuild_codebook:
+        logger.info(f"Loading existing AnyLoc codebook from {codebook_path}")
+        codebook = np.load(codebook_path)
+    else:
+        codebook = build_anyloc_vocabulary(entries, ANYLOC_K, model, device, transform)
+        np.save(codebook_path, codebook)
+        logger.info(f"AnyLoc codebook saved to {codebook_path}")
+
+    descriptors, labels = [], []
+    for path, image_id in tqdm(entries, desc="AnyLoc-DINOv2-VLAD extraction"):
+        try:
+            img = Image.open(path).convert("RGB")
+            tensor = transform(img).unsqueeze(0).to(device)
+            tokens = extract_dinov2_patch_tokens(tensor, model)
+        except Exception as e:
+            logger.warning(f"Skipping {path}: {e}")
+            continue
+
+        descriptors.append(compute_anyloc_vlad(tokens, codebook))
+        labels.append(image_id)
+
+    descriptors = np.array(descriptors, dtype=np.float32)
+    labels_arr = np.array(labels)
+
+    np.save(save_dir / "anyloc_dinov2_vlad_descriptors.npy", descriptors)
+    np.save(save_dir / "anyloc_dinov2_vlad_labels.npy", labels_arr)
+    logger.info(f"AnyLoc-DINOv2-VLAD: saved {len(descriptors)} vectors of dim {descriptors.shape[1]}")
+
+    return descriptors, labels
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract image features for retrieval")
-    parser.add_argument("--method",  choices=["sift", "orb", "dinov2", "both", "all"],
-                        default="both", help="'both'=SIFT+DINOv2, 'all'=includes ORB")
+    parser.add_argument("--method",  choices=["sift", "orb", "dinov2", "anyloc", "both", "all"],
+                        default="both", help="'both'=SIFT+DINOv2, 'all'=includes ORB+AnyLoc")
     parser.add_argument("--dir",     type=Path, default=PROCESSED_DIR)
     parser.add_argument("--out-dir", type=Path, default=MODELS_DIR)
+    parser.add_argument("--include-aug-in-index", action="store_true", default=False,
+                        help="Also index augmented variants. Use only for an explicitly documented experiment.")
     parser.add_argument("--no-aug",  action="store_true", default=False,
-                        help="Only extract from original images (skip augmented variants)")
+                        help="Deprecated alias for the default originals-only database split")
+    parser.add_argument("--rebuild-codebooks", action="store_true", default=False,
+                        help="Recompute SIFT/ORB visual vocabularies instead of reusing saved codebooks")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for descriptor sampling and OpenCV k-means")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    entries = collect_image_paths(args.dir, skip_aug=args.no_aug)
+    np.random.seed(args.seed)
+    cv2.setRNGSeed(args.seed)
+
+    skip_aug = not args.include_aug_in_index or args.no_aug
+    entries = collect_image_paths(args.dir, skip_aug=skip_aug)
 
     if not entries:
         logger.error(f"No images found in {args.dir}. Run preprocess.py first.")
         return
 
+    metadata = {
+        "data_dir": str(args.dir),
+        "n_images": len(entries),
+        "database_split": "originals_only" if skip_aug else "originals_plus_augmentations",
+        "seed": args.seed,
+        "methods": args.method,
+    }
+    with open(args.out_dir / "extraction_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
     if args.method in ("sift", "both", "all"):
         logger.info("=== METHOD A: SIFT + VLAD ===")
-        extract_sift_vlad(entries, args.out_dir)
+        extract_sift_vlad(entries, args.out_dir, rebuild_codebook=args.rebuild_codebooks)
 
     if args.method in ("orb", "all"):
         logger.info("=== METHOD B: ORB + Bag-of-Words ===")
-        extract_orb_bow(entries, args.out_dir)
+        extract_orb_bow(entries, args.out_dir, rebuild_codebook=args.rebuild_codebooks)
 
     if args.method in ("dinov2", "both", "all"):
         logger.info("=== METHOD C: DINOv2 ===")
         extract_dinov2(entries, args.out_dir)
+
+    if args.method in ("anyloc", "all"):
+        logger.info("=== METHOD D: AnyLoc-DINOv2-VLAD ===")
+        extract_anyloc_dinov2_vlad(entries, args.out_dir, rebuild_codebook=args.rebuild_codebooks)
 
     logger.info("Feature extraction complete. Next: python src/index.py")
 

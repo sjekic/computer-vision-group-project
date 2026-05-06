@@ -366,11 +366,14 @@ def parse_args():
     p.add_argument("--dry-run",    action="store_true", default=False, help="Run without writing files")
     p.add_argument("--query-mode", action="store_true", default=False,
                    help="Process images from --raw-dir as query images (no augmentation, saved to data/query/)")
+    p.add_argument("--seed",       type=int, default=42,
+                   help="Random seed for stochastic augmentations such as Gaussian noise")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    np.random.seed(args.seed)
 
     out = QUERY_DIR if args.query_mode else args.out_dir
     df = process_dataset(

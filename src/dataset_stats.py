@@ -48,7 +48,7 @@ def phash(img_path: Path, hash_size: int = 16) -> np.ndarray:
         return None
     img = cv2.resize(img, (hash_size * 4, hash_size * 4))
     img_f = np.float32(img)
-    dct = cv2.dct(dct := cv2.dct(img_f))           # 2D DCT
+    dct = cv2.dct(img_f)
     dct_low = dct[:hash_size, :hash_size]
     med = np.median(dct_low)
     return (dct_low > med).flatten()
