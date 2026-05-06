@@ -1,15 +1,21 @@
+import warnings
+warnings.filterwarnings("ignore", message="xFormers is not available", category=UserWarning)
+
 """
 Image Retrieval — Query Interface
 ===================================
 Given a query image, retrieves the top-K most similar images from the database
-using either SIFT+VLAD or DINOv2.
+using SIFT+VLAD, ORB+BoW, DINOv2, AnyLoc, or CNN (ResNet-50).
 
 Usage:
-    # Single query, both methods
+    # Single query, both default methods (sift + dinov2)
     python src/retrieve.py --query data/query/my_photo.jpg
 
-    # Top-5, DINOv2 only
-    python src/retrieve.py --query data/query/my_photo.jpg --method dinov2 --k 5
+    # CNN only
+    python src/retrieve.py --query data/query/my_photo.jpg --method cnn
+
+    # All methods
+    python src/retrieve.py --query data/query/my_photo.jpg --method all
 
     # Show results visually
     python src/retrieve.py --query data/query/my_photo.jpg --show
@@ -110,7 +116,7 @@ def query_sift_vlad(img_rgb: np.ndarray, index: faiss.Index,
     return results, latency_ms
 
 
-# ─── DINOv2 query ─────────────────────────────────────────────────────────────
+# ─── ORB + BoW query ──────────────────────────────────────────────────────────
 
 def query_orb_bow(img_rgb: np.ndarray, index: faiss.Index,
                   codebook: np.ndarray, labels: list[str], k: int):
@@ -139,6 +145,8 @@ def query_orb_bow(img_rgb: np.ndarray, index: faiss.Index,
     return results, latency_ms
 
 
+# ─── DINOv2 query ─────────────────────────────────────────────────────────────
+
 def query_dinov2(img_rgb: np.ndarray, index: faiss.Index,
                  labels: list[str], k: int, model, device, transform):
     from PIL import Image
@@ -162,6 +170,8 @@ def query_dinov2(img_rgb: np.ndarray, index: faiss.Index,
     return results, latency_ms
 
 
+# ─── AnyLoc query ─────────────────────────────────────────────────────────────
+
 def query_anyloc(img_rgb: np.ndarray, index: faiss.Index,
                  codebook: np.ndarray, labels: list[str], k: int,
                  model, device, transform):
@@ -174,6 +184,24 @@ def query_anyloc(img_rgb: np.ndarray, index: faiss.Index,
     return results, latency_ms
 
 
+# ─── CNN (ResNet-50) query ────────────────────────────────────────────────────
+
+def query_cnn(img_rgb: np.ndarray, index: faiss.Index,
+             labels: list[str], k: int, model, device, transform):
+    """Query using CNN (ResNet-50) global average-pooled features."""
+    from cnn_features import extract_cnn_features
+
+    feat = extract_cnn_features(img_rgb, model, device, transform)  # (2048,) L2-normalised
+    vec = feat.reshape(1, -1).astype(np.float32)
+
+    t0 = time.perf_counter()
+    scores, indices = index.search(vec, k)
+    latency_ms = (time.perf_counter() - t0) * 1000
+
+    results = [(labels[i], float(scores[0][j])) for j, i in enumerate(indices[0]) if i >= 0]
+    return results, latency_ms
+
+
 # ─── Result display ───────────────────────────────────────────────────────────
 
 def extract_location(image_id: str) -> str:
@@ -182,16 +210,16 @@ def extract_location(image_id: str) -> str:
 
 
 def print_results(method: str, results: list, latency_ms: float, query_location: str = None):
-    print(f"\n{'─'*55}")
-    print(f"  {method.upper()} — Top-{len(results)} results  ({latency_ms:.1f} ms)")
-    print(f"{'─'*55}")
+    print(f"\n{'\u2500'*55}")
+    print(f"  {method.upper()} \u2014 Top-{len(results)} results  ({latency_ms:.1f} ms)")
+    print(f"{'\u2500'*55}")
     for rank, (image_id, score) in enumerate(results, 1):
         loc = extract_location(image_id)
         correct = ""
         if query_location and loc == query_location:
-            correct = "  ✓"
+            correct = "  \u2713"
         print(f"  #{rank:2d}  {loc:<30}  score={score:.4f}{correct}")
-    print(f"{'─'*55}")
+    print(f"{'\u2500'*55}")
 
     if query_location:
         top1_loc = extract_location(results[0][0]) if results else ""
@@ -234,7 +262,7 @@ def show_results_grid(query_path: Path, results: list[tuple[str, float]], method
 
     if imgs:
         grid = np.hstack(imgs)
-        cv2.imshow(f"Retrieval results — {method}", grid)
+        cv2.imshow(f"Retrieval results \u2014 {method}", grid)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 
@@ -242,7 +270,7 @@ def show_results_grid(query_path: Path, results: list[tuple[str, float]], method
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def load_resources(method: str, models_dir: Path, index_type: str = "flat", nprobe: int = 10):
-    """Load index, labels and (for dinov2) model."""
+    """Load index, labels and (for deep methods) model."""
     resources = {}
     methods = resolve_methods(method)
 
@@ -286,7 +314,8 @@ def load_resources(method: str, models_dir: Path, index_type: str = "flat", npro
             from torchvision import transforms
 
             logger.info("Loading DINOv2 model for inference...")
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+                                   pretrained=True, verbose=False)
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = model.to(device).eval()
 
@@ -319,7 +348,8 @@ def load_resources(method: str, models_dir: Path, index_type: str = "flat", npro
             from torchvision import transforms
 
             logger.info("Loading DINOv2 model for AnyLoc inference...")
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14", pretrained=True)
+            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14",
+                                   pretrained=True, verbose=False)
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = model.to(device).eval()
             transform = transforms.Compose([
@@ -340,6 +370,26 @@ def load_resources(method: str, models_dir: Path, index_type: str = "flat", npro
             }
             if hasattr(resources["anyloc"]["index"], "nprobe"):
                 resources["anyloc"]["index"].nprobe = nprobe
+
+    if "cnn" in methods:
+        idx_path = models_dir / index_filename("cnn", index_type)
+        lb_path  = models_dir / "cnn_labels.npy"
+        if not all(p.exists() for p in [idx_path, lb_path]):
+            logger.error("CNN resources missing. Run extract.py --method cnn and index.py --method cnn first.")
+        else:
+            from cnn_features import build_cnn_model
+            logger.info("Loading ResNet-50 model for CNN inference...")
+            model, device, transform = build_cnn_model()
+
+            resources["cnn"] = {
+                "index":     faiss.read_index(str(idx_path)),
+                "labels":    list(np.load(lb_path)),
+                "model":     model,
+                "device":    device,
+                "transform": transform,
+            }
+            if hasattr(resources["cnn"]["index"], "nprobe"):
+                resources["cnn"]["index"].nprobe = nprobe
 
     return resources
 
@@ -386,12 +436,24 @@ def run_query(query_path: Path, resources: dict, k: int, show: bool,
         if show:
             show_results_grid(query_path, results, "AnyLoc-DINOv2-VLAD")
 
+    if "cnn" in resources:
+        r = resources["cnn"]
+        results, latency = query_cnn(
+            img, r["index"], r["labels"], k,
+            r["model"], r["device"], r["transform"]
+        )
+        print_results("CNN (ResNet-50)", results, latency, query_location)
+        if show:
+            show_results_grid(query_path, results, "CNN")
+
 
 def main():
     parser = argparse.ArgumentParser(description="Query the image retrieval system")
     parser.add_argument("--query",        type=Path, default=None, help="Single query image path")
     parser.add_argument("--query-dir",    type=Path, default=None, help="Folder of query images")
-    parser.add_argument("--method",       choices=["sift", "orb", "dinov2", "anyloc", "both", "all"], default="both")
+    parser.add_argument("--method",
+                        choices=["sift", "orb", "dinov2", "anyloc", "cnn", "both", "all"],
+                        default="both")
     parser.add_argument("--k",            type=int, default=5,    help="Number of results to return")
     parser.add_argument("--show",         action="store_true",    help="Display results visually")
     parser.add_argument("--models-dir",   type=Path, default=MODELS_DIR)
@@ -417,7 +479,6 @@ def main():
         logger.info(f"Running {len(queries)} queries from {args.query_dir}")
         for qp in sorted(queries):
             print(f"\nQuery: {qp.name}")
-            # If query images are in location sub-folders, use folder name as ground truth
             gt = qp.parent.name if qp.parent != args.query_dir else None
             run_query(qp, resources, args.k, args.show, query_location=gt)
 
