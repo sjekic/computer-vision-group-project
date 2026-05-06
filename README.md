@@ -1,6 +1,16 @@
 # Fast Image Search — IE Tower Visual Place Recognition
 
-End-to-end image retrieval system for the IE Tower area. Given a query image, the system returns the most visually similar database images and identifies the location.
+End-to-end image retrieval system for the IE Tower area. Given a query image, the system returns the most visually similar database images and identifies the location. Supports three methods for comparative analysis.
+
+---
+
+## Methods Compared
+
+| Method | Descriptor | Aggregation | Search | Notes |
+|---|---|---|---|---|
+| **SIFT + VLAD** | SIFT (128-dim) keypoints | VLAD (k=64) | FAISS L2 | Classical, scale/rotation invariant |
+| **ORB + BoW** | ORB (32-dim) keypoints | Bag-of-Words (k=64) | FAISS L2 | Fastest, binary descriptors |
+| **DINOv2** | ViT-S/14 global embedding | — | FAISS IP (cosine) | State-of-the-art accuracy |
 
 ---
 
@@ -9,19 +19,21 @@ End-to-end image retrieval system for the IE Tower area. Given a query image, th
 ```
 computer-vision-group-project/
 ├── data/
-│   ├── raw/              ← your captured images (one sub-folder per location)
-│   │   └── <location>/
-│   ├── processed/        ← output of preprocessing pipeline
-│   └── query/            ← images used as search queries
+│   ├── raw/              ← original captured images (one sub-folder per location)
+│   ├── processed/        ← resized, CLAHE, augmented images + manifest.csv
+│   └── query/            ← held-out query images for evaluation
 ├── src/
-│   ├── preprocess.py     ← data cleaning, resizing, augmentation
-│   ├── dataset_stats.py  ← validation, brightness check, duplicate detection
-│   ├── extract.py        ← feature extraction (SIFT / DINOv2)       [TODO]
-│   ├── index.py          ← FAISS index build & save                  [TODO]
-│   └── retrieve.py       ← query → top-K results                     [TODO]
+│   ├── download_dataset.py   ← Step 0: pull images from Google Drive
+│   ├── preprocess.py         ← Step 1: resize, CLAHE, 20× augmentation
+│   ├── dataset_stats.py      ← Step 1b: validate dataset, detect duplicates
+│   ├── extract.py            ← Step 2: SIFT+VLAD / ORB+BoW / DINOv2 features
+│   ├── index.py              ← Step 3: build FAISS indexes
+│   ├── retrieve.py           ← Step 4: query → top-K results (terminal)
+│   ├── evaluate.py           ← Step 5: Top-K accuracy, mAP, latency, memory
+│   └── demo.py               ← Step 6: visual grid demo for recording
+├── models/               ← saved descriptors, codebooks, FAISS indexes
+├── results/              ← evaluation CSVs, demo grids, reports
 ├── notebooks/            ← exploratory analysis
-├── models/               ← saved embeddings / index files
-├── results/              ← evaluation outputs, reports
 ├── requirements.txt
 └── README.md
 ```
@@ -31,140 +43,141 @@ computer-vision-group-project/
 ## Setup
 
 ```bash
-# 1. Clone
 git clone https://github.com/sjekic/computer-vision-group-project.git
 cd computer-vision-group-project
 
-# 2. Create virtual environment
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 
-# 3. Install dependencies
 pip install -r requirements.txt
 ```
 
 ---
 
-## Step 0 — Download the Dataset from Google Drive
+## Step 0 — Download Dataset from Google Drive
 
-The dataset lives in a shared Google Drive folder. Run the download script once and it will mirror all 35 location folders into `data/raw/` automatically.
+Each teammate needs a `credentials.json` from Google Cloud Console (one-time, ~3 min setup):
 
-### One-time credentials setup (each teammate does this once)
-
-You need a `credentials.json` file from Google Cloud Console. This is a free, standard OAuth2 step:
-
-1. Go to [Google Cloud Console](https://console.cloud.google.com/) and create a project (or use an existing one)
-2. Navigate to **APIs & Services → Library** and enable the **Google Drive API**
-3. Go to **APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client ID**
-4. Choose **Desktop app** as the application type, give it any name
-5. Click **Download JSON** and rename the file to `credentials.json`
-6. Place `credentials.json` in the **project root** (same level as README.md)
-
-> `credentials.json` and `token.json` are in `.gitignore` — they will never be accidentally committed.
-
-### Download
+1. Go to [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials)
+2. Enable **Google Drive API** → **Create Credentials → OAuth 2.0 Client ID → Desktop app**
+3. Download JSON → rename to `credentials.json` → place in project root
 
 ```bash
-# First run: opens a browser window for Google sign-in consent (takes ~10 seconds)
-python src/download_dataset.py
-
-# Subsequent runs: fully automatic (token is cached in token.json)
-python src/download_dataset.py
-
-# Preview what would be downloaded without writing files
-python src/download_dataset.py --dry-run
-
-# Force re-download everything (ignore already-existing files)
-python src/download_dataset.py --no-resume
+python src/download_dataset.py        # browser auth on first run, silent after
 ```
 
-The script will:
-- Authenticate via OAuth2 (browser popup on first run only)
-- Walk all 35 location sub-folders recursively
-- Download only image files (jpg, png, heic, etc.), skip anything else
-- Skip files already present locally (`--resume` is on by default)
-- Print a summary of downloaded / skipped / failed counts
-
----
-
-## Data Organisation
-
-Place your raw images under `data/raw/` with one sub-folder per location:
-
-```
-data/raw/
-    lobby/
-        img_001.jpg
-        img_002.jpg
-    rooftop_terrace/
-        img_001.jpg
-    ...
-```
-
-> The location folder name becomes the class label used throughout the pipeline.
+> `credentials.json` and `token.json` are gitignored — never committed.
 
 ---
 
 ## Step 1 — Preprocessing
 
 ```bash
-# Basic: resize to 640×480, apply CLAHE histogram equalisation
-python src/preprocess.py
-
-# With augmentation (recommended for building the database)
+# Resize to 640×480, apply CLAHE, generate 20 augmentation variants per image
 python src/preprocess.py --augment
 
-# Custom size
-python src/preprocess.py --size 800 600 --augment
-
-# Dry run (no files written, just counts)
-python src/preprocess.py --dry-run
-
-# Process query images (no augmentation, saved to data/query/)
-python src/preprocess.py --raw-dir data/raw/my_queries --query-mode
+# Validate dataset health (brightness, duplicates, per-location counts)
+python src/dataset_stats.py
 ```
 
-**What the script does:**
-| Step | Detail |
-|---|---|
-| Validation | Skips corrupt / unreadable files |
-| Resize + pad | Aspect-ratio-preserving resize → letterbox pad to target size |
-| CLAHE | Contrast Limited Adaptive Histogram Equalisation on L channel (LAB) — improves robustness to lighting changes |
-| Augmentation | 6 variants per image: brightness ±30%, horizontal flip, 5° rotation, Gaussian blur, desaturation |
-| Manifest | `data/processed/manifest.csv` — image_id, location, path, aug_type |
+**Augmentations (20 per image):** brightness ±35%, overexposure, contrast ±, saturation ±, warm/cool tint, blur (×2), noise, JPEG artefacts, flip, rotation ±5°, corner crops, zoom, perspective skew (H+V).
 
 ---
 
-## Step 2 — Dataset Validation
+## Step 2 — Feature Extraction
 
 ```bash
-python src/dataset_stats.py                   # checks data/processed/
-python src/dataset_stats.py --dir data/raw    # checks raw images
+# Extract all three methods (recommended)
+python src/extract.py --method all
+
+# Or individually
+python src/extract.py --method sift
+python src/extract.py --method orb
+python src/extract.py --method dinov2
+
+# Quick test on originals only (275 images, ~2 min)
+python src/extract.py --method all --no-aug
 ```
 
-Outputs:
-- Per-location image counts and resolution stats
-- Mean brightness (flags very dark / overexposed images)
-- Near-duplicate detection via perceptual hashing (pHash, threshold ≤ 8 bits)
-- `results/dataset_report.txt` and `results/dataset_stats.csv`
+Outputs saved to `models/`: descriptor `.npy` arrays, codebooks, labels.
 
 ---
 
-## Methods Compared
+## Step 3 — Build FAISS Indexes
 
-| Method | Descriptor | Matching | Notes |
-|---|---|---|---|
-| Classical | SIFT keypoints + VLAD/BoW | Brute-force / FLANN | Fast, interpretable |
-| Deep | DINOv2 ViT-S/14 global embedding | FAISS approximate NN | State-of-the-art accuracy |
+```bash
+python src/index.py --method all
+```
+
+---
+
+## Step 4 — Query the System
+
+```bash
+# Query with a single image
+python src/retrieve.py --query data/query/my_photo.jpg --k 5
+
+# Show results visually (OpenCV window)
+python src/retrieve.py --query data/query/my_photo.jpg --show
+
+# Use only one method
+python src/retrieve.py --query data/query/my_photo.jpg --method dinov2
+```
+
+---
+
+## Step 5 — Evaluate
+
+```bash
+# Evaluate using augmented variants as synthetic queries
+python src/evaluate.py --method all --save
+
+# Evaluate using a dedicated query folder (ground truth = sub-folder name)
+python src/evaluate.py --method all --query-dir data/query/ --save
+
+# Quick run on 50 queries
+python src/evaluate.py --method all --max-queries 50
+```
+
+**Output:**
+```
+===========================================================================
+  EVALUATION RESULTS
+===========================================================================
+  Method              mAP     Top-1   Top-3   Top-5  Top-10  Lat(ms)  Mem(MB)
+  -----------------------------------------------------------------------
+  SIFT+VLAD          0.xxx   xx.x%   xx.x%   xx.x%  xx.x%     x.xx     x.x
+  ORB+BoW            0.xxx   xx.x%   xx.x%   xx.x%  xx.x%     x.xx     x.x
+  DINOv2 ViT-S/14   0.xxx   xx.x%   xx.x%   xx.x%  xx.x%     x.xx     x.x
+===========================================================================
+```
+
+Results saved to `results/evaluation_results.csv`.
+
+---
+
+## Step 6 — Demo (for recorded demonstration)
+
+```bash
+# Show visual grid: query + top-5 matches per method
+python src/demo.py --query data/query/my_photo.jpg
+
+# Save the grid image instead of showing it
+python src/demo.py --query data/query/my_photo.jpg --save --no-show
+```
+
+The demo window shows a colour-coded grid with the query image and retrieved results. Correct location matches are highlighted in green.
 
 ---
 
 ## Evaluation Metrics
 
-- **Top-K accuracy** (K = 1, 3, 5)
-- **Mean Average Precision (mAP)**
-- **Query latency** (ms per query)
-- **Memory footprint** of the index
+| Metric | Description |
+|---|---|
+| **Top-K Accuracy** | % of queries where correct location appears in top K results (K=1,3,5,10) |
+| **mAP** | Mean Average Precision — accounts for ranking quality |
+| **Query Latency** | Mean search time per query in ms (FAISS search only) |
+| **Memory** | Index footprint in MB |
 
 ---
 

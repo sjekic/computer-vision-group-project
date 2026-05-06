@@ -231,7 +231,96 @@ def extract_sift_vlad(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# METHOD B: DINOv2
+# METHOD B: ORB + Bag-of-Words
+# ─────────────────────────────────────────────────────────────────────────────
+
+ORB_K = 64   # BoW vocabulary size (same as VLAD_K for fair comparison)
+
+
+def extract_orb_raw(path: Path, orb) -> np.ndarray | None:
+    """Extract raw ORB binary descriptors (float32 for FLANN). Returns (N, 32) or None."""
+    img = load_image_gray(path)
+    _, desc = orb.detectAndCompute(img, None)
+    return desc.astype(np.float32) if desc is not None else None
+
+
+def build_orb_vocabulary(entries: list[tuple[Path, str]], k: int) -> np.ndarray:
+    """Build BoW vocabulary from ORB descriptors via k-means."""
+    logger.info(f"Building ORB BoW vocabulary (k={k})...")
+    orb = cv2.ORB_create(nfeatures=500)
+    all_descs = []
+
+    for path, _ in tqdm(entries, desc="Sampling ORB descriptors"):
+        desc = extract_orb_raw(path, orb)
+        if desc is not None:
+            idx = np.random.choice(len(desc), min(50, len(desc)), replace=False)
+            all_descs.append(desc[idx])
+
+    all_descs = np.vstack(all_descs).astype(np.float32)
+    logger.info(f"Running k-means on {len(all_descs)} ORB descriptors...")
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    _, _, codebook = cv2.kmeans(
+        all_descs, k, None, criteria,
+        attempts=5, flags=cv2.KMEANS_PP_CENTERS
+    )
+    logger.info("ORB vocabulary built.")
+    return codebook
+
+
+def compute_bow(descriptors: np.ndarray | None, codebook: np.ndarray) -> np.ndarray:
+    """Compute normalised Bag-of-Words histogram. Returns (k,) float32 vector."""
+    k = codebook.shape[0]
+    bow = np.zeros(k, dtype=np.float32)
+    if descriptors is None or len(descriptors) == 0:
+        return bow
+
+    flann = cv2.FlannBasedMatcher(
+        {"algorithm": 6, "table_number": 6, "key_size": 12, "multi_probe_level": 1},
+        {"checks": 32}
+    )
+    matches = flann.knnMatch(descriptors.astype(np.float32), codebook.astype(np.float32), k=1)
+    for m in matches:
+        if m:
+            bow[m[0].trainIdx] += 1
+
+    norm = np.linalg.norm(bow)
+    return bow / norm if norm > 0 else bow
+
+
+def extract_orb_bow(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[np.ndarray, list[str]]:
+    """Full ORB+BoW pipeline. Returns (descriptors, labels) and saves to disk."""
+    codebook_path = save_dir / "orb_codebook.npy"
+
+    if codebook_path.exists():
+        logger.info(f"Loading existing ORB codebook from {codebook_path}")
+        codebook = np.load(codebook_path)
+    else:
+        codebook = build_orb_vocabulary(entries, ORB_K)
+        np.save(codebook_path, codebook)
+        logger.info(f"ORB codebook saved to {codebook_path}")
+
+    orb = cv2.ORB_create(nfeatures=500)
+    descriptors, labels = [], []
+
+    for path, image_id in tqdm(entries, desc="ORB+BoW extraction"):
+        raw = extract_orb_raw(path, orb)
+        bow_vec = compute_bow(raw, codebook)
+        descriptors.append(bow_vec)
+        labels.append(image_id)
+
+    descriptors = np.array(descriptors, dtype=np.float32)
+    labels = np.array(labels)
+
+    np.save(save_dir / "orb_descriptors.npy", descriptors)
+    np.save(save_dir / "orb_labels.npy",      labels)
+    logger.info(f"ORB+BoW: saved {len(descriptors)} vectors of dim {descriptors.shape[1]}")
+
+    return descriptors, list(labels)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METHOD C: DINOv2
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_dinov2_model():
@@ -324,7 +413,8 @@ def extract_dinov2(entries: list[tuple[Path, str]], save_dir: Path) -> tuple[np.
 
 def main():
     parser = argparse.ArgumentParser(description="Extract image features for retrieval")
-    parser.add_argument("--method",  choices=["sift", "dinov2", "both"], default="both")
+    parser.add_argument("--method",  choices=["sift", "orb", "dinov2", "both", "all"],
+                        default="both", help="'both'=SIFT+DINOv2, 'all'=includes ORB")
     parser.add_argument("--dir",     type=Path, default=PROCESSED_DIR)
     parser.add_argument("--out-dir", type=Path, default=MODELS_DIR)
     parser.add_argument("--no-aug",  action="store_true", default=False,
@@ -338,12 +428,16 @@ def main():
         logger.error(f"No images found in {args.dir}. Run preprocess.py first.")
         return
 
-    if args.method in ("sift", "both"):
+    if args.method in ("sift", "both", "all"):
         logger.info("=== METHOD A: SIFT + VLAD ===")
         extract_sift_vlad(entries, args.out_dir)
 
-    if args.method in ("dinov2", "both"):
-        logger.info("=== METHOD B: DINOv2 ===")
+    if args.method in ("orb", "all"):
+        logger.info("=== METHOD B: ORB + Bag-of-Words ===")
+        extract_orb_bow(entries, args.out_dir)
+
+    if args.method in ("dinov2", "both", "all"):
+        logger.info("=== METHOD C: DINOv2 ===")
         extract_dinov2(entries, args.out_dir)
 
     logger.info("Feature extraction complete. Next: python src/index.py")

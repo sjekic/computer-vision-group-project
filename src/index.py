@@ -51,13 +51,14 @@ def build_index(descriptors: np.ndarray, metric: str) -> faiss.Index:
 
 def main():
     parser = argparse.ArgumentParser(description="Build FAISS retrieval indexes")
-    parser.add_argument("--method",  choices=["sift", "dinov2", "both"], default="both")
+    parser.add_argument("--method",  choices=["sift", "orb", "dinov2", "both", "all"],
+                        default="both", help="'both'=SIFT+DINOv2, 'all'=includes ORB")
     parser.add_argument("--out-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.method in ("sift", "both"):
+    if args.method in ("sift", "both", "all"):
         desc_path = args.out_dir / "sift_vlad_descriptors.npy"
         if not desc_path.exists():
             logger.error(f"{desc_path} not found. Run extract.py --method sift first.")
@@ -65,9 +66,19 @@ def main():
             descs = np.load(desc_path)
             index = build_index(descs, metric="l2")
             faiss.write_index(index, str(args.out_dir / "sift_vlad.index"))
-            logger.info(f"Saved: models/sift_vlad.index")
+            logger.info("Saved: models/sift_vlad.index")
 
-    if args.method in ("dinov2", "both"):
+    if args.method in ("orb", "all"):
+        desc_path = args.out_dir / "orb_descriptors.npy"
+        if not desc_path.exists():
+            logger.error(f"{desc_path} not found. Run extract.py --method orb first.")
+        else:
+            descs = np.load(desc_path)
+            index = build_index(descs, metric="l2")
+            faiss.write_index(index, str(args.out_dir / "orb_bow.index"))
+            logger.info("Saved: models/orb_bow.index")
+
+    if args.method in ("dinov2", "both", "all"):
         desc_path = args.out_dir / "dinov2_descriptors.npy"
         if not desc_path.exists():
             logger.error(f"{desc_path} not found. Run extract.py --method dinov2 first.")
@@ -75,7 +86,7 @@ def main():
             descs = np.load(desc_path)
             index = build_index(descs, metric="ip")
             faiss.write_index(index, str(args.out_dir / "dinov2.index"))
-            logger.info(f"Saved: models/dinov2.index")
+            logger.info("Saved: models/dinov2.index")
 
     logger.info("Indexing complete. Next: python src/retrieve.py --query <image_path>")
 
