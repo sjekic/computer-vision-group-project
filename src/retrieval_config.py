@@ -33,6 +33,14 @@ METHOD_ARTIFACTS = {
         "codebook": "anyloc_dinov2_codebook.npy",
         "metric": "ip",
     },
+    "cnn": {
+        "display": "CNN (ResNet-50)",
+        "descriptor": "cnn_descriptors.npy",
+        "label": "cnn_labels.npy",
+        "index": "cnn.index",
+        "codebook": None,
+        "metric": "ip",  # L2-normalised vectors → inner-product == cosine
+    },
 }
 
 
@@ -41,7 +49,7 @@ def resolve_methods(choice: str) -> list[str]:
     if choice == "both":
         return ["sift", "dinov2"]
     if choice == "all":
-        return ["sift", "orb", "dinov2", "anyloc"]
+        return ["sift", "orb", "dinov2", "anyloc", "cnn"]
     if choice in METHOD_ARTIFACTS:
         return [choice]
     raise ValueError(f"Unknown method: {choice}")
